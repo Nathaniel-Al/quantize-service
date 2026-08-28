@@ -37,10 +37,12 @@ def validate_freeze_structure(body: Dict[str, Any]) -> bool:
             return False
 
     candidates = body.get("candidates")
-    # Fix: Allow empty list [] for zero-candidate test cases
     if not isinstance(candidates, list):
         logger.warning("Freeze validation failed: 'candidates' field missing or not a list.")
         return False
+
+    top_cal = body.get("calibrationDigest")
+    top_tok = body.get("tokenizerDigest")
 
     for idx, c in enumerate(candidates):
         if not isinstance(c, dict):
@@ -54,11 +56,15 @@ def validate_freeze_structure(body: Dict[str, Any]) -> bool:
             if not isinstance(c.get("loadable"), bool):
                 logger.warning(f"Freeze validation failed: Candidate '{c.get('name')}' missing 'loadable' bool.")
                 return False
-            if not isinstance(c.get("calibrationDigest"), str):
-                logger.warning(f"Freeze validation failed: Candidate '{c.get('name')}' missing 'calibrationDigest'.")
+
+            cand_cal = c.get("calibrationDigest", top_cal)
+            cand_tok = c.get("tokenizerDigest", top_tok)
+
+            if not isinstance(cand_cal, str):
+                logger.warning(f"Freeze validation failed: Candidate '{c.get('name')}' missing valid 'calibrationDigest'.")
                 return False
-            if not isinstance(c.get("tokenizerDigest"), str):
-                logger.warning(f"Freeze validation failed: Candidate '{c.get('name')}' missing 'tokenizerDigest'.")
+            if not isinstance(cand_tok, str):
+                logger.warning(f"Freeze validation failed: Candidate '{c.get('name')}' missing valid 'tokenizerDigest'.")
                 return False
 
     return True
@@ -152,11 +158,16 @@ def recompute_manifest(base_candidate: Dict[str, Any], files: List[Dict[str, Any
 def compute_freeze_response(body: Dict[str, Any]) -> Dict[str, Any]:
     allowed_reasons = set(body.get("allowedUnsupportedReasons", []))
     candidates = body.get("candidates", [])
+    top_cal = body.get("calibrationDigest")
+    top_tok = body.get("tokenizerDigest")
 
     results = []
     for c in candidates:
         name = c["name"]
         unsupported = c.get("unsupportedReason")
+
+        cand_cal = c.get("calibrationDigest", top_cal)
+        cand_tok = c.get("tokenizerDigest", top_tok)
 
         if unsupported:
             if unsupported in allowed_reasons:
@@ -165,13 +176,25 @@ def compute_freeze_response(body: Dict[str, Any]) -> Dict[str, Any]:
                 status = "REJECTED_UNSUPPORTED"
         elif not c.get("loadable", False):
             status = "UNLOADABLE"
+        elif top_cal and cand_cal != top_cal:
+            status = "UNLOADABLE"
+        elif top_tok and cand_tok != top_tok:
+            status = "UNLOADABLE"
         else:
             status = "FROZEN"
             STORED_CANDIDATES[name] = c
 
         results.append({"name": name, "status": status})
 
-    return {"candidates": results}
+    response: Dict[str, Any] = {"candidates": results}
+
+    # Echo back metadata identifiers if present
+    if "freezeId" in body:
+        response["freezeId"] = body["freezeId"]
+    if "phase" in body:
+        response["phase"] = body["phase"]
+
+    return response
 
 
 def handle_select(body: Dict[str, Any]) -> Dict[str, Any]:
@@ -216,10 +239,17 @@ def handle_select(body: Dict[str, Any]) -> Dict[str, Any]:
 
     selected_candidate = admitted_sorted[0]["candidate"] if admitted_sorted else None
 
-    return {
+    response: Dict[str, Any] = {
         "selected": selected_candidate["name"] if selected_candidate else None,
         "admittedCount": len(admitted_sorted),
     }
+
+    if "selectId" in body:
+        response["selectId"] = body["selectId"]
+    if "phase" in body:
+        response["phase"] = body["phase"]
+
+    return response
 
 
 def handle_quantize(body: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], bool]:
@@ -288,7 +318,6 @@ def quantize_endpoint():
 
     phase = body.get("phase")
 
-    # Route based on the 'phase' parameter inside the request body
     if phase == "freeze":
         if not validate_freeze_structure(body):
             logger.warning("Freeze phase validation failed inside /quantize endpoint.")
@@ -304,7 +333,6 @@ def quantize_endpoint():
             return jsonify({"error": "INVALID_INPUT"}), 400
         return jsonify(handle_select(body)), 200
 
-    # Default quantization handler
     if not validate_quantize_structure(body):
         logger.warning(f"POST /quantize validation rejected payload: {body}")
         return jsonify({"error": "INVALID_INPUT"}), 400
