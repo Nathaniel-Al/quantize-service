@@ -73,12 +73,24 @@ def process_freeze(payload: Dict[str, Any]):
 # Phase 2: Selection Logic
 # ==========================================
 
+def sanitize_policy(policy: Dict[str, Any]) -> Dict[str, Any]:
+    """Sanitizes policy bounds by resetting negative byte constraints to unbounded (None)."""
+    sanitized = dict(policy)
+
+    for byte_key in ("maxBytes", "maxTotalBytes"):
+        if byte_key in sanitized:
+            val = sanitized[byte_key]
+            if val is not None and (not isinstance(val, (int, float)) or val < 0):
+                logger.info(f"Sanitizing negative or invalid '{byte_key}' ({val}) to unbounded (None).")
+                sanitized[byte_key] = None
+
+    return sanitized
+
+
 def validate_policy_payload(policy: Dict[str, Any]) -> Optional[str]:
-    """Validates policy structure and bounds."""
-    max_bytes = policy.get("maxBytes", policy.get("maxTotalBytes"))
-    if max_bytes is not None and max_bytes < 0:
-        logger.warning(f"Policy validation failed: Invalid maxBytes/maxTotalBytes '{max_bytes}'.")
-        return f"Invalid maxBytes/maxTotalBytes '{max_bytes}'."
+    """Validates policy structure."""
+    if not isinstance(policy, dict):
+        return "Policy must be a JSON object."
     return None
 
 
@@ -126,7 +138,7 @@ def evaluate_accuracy(candidate_name: str, rows: List[Dict[str, Any]], policy: D
 
 def select_candidate(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Evaluates valid candidates in candidateOrder and selects the optimal one."""
-    policy = payload.get("policy", {})
+    policy = sanitize_policy(payload.get("policy", {}))
     latencies = payload.get("latencies", {})
     rows = payload.get("rows", [])
     freeze_id = payload.get("freezeId")
@@ -136,8 +148,15 @@ def select_candidate(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     candidate_map = {c["name"]: c for c in candidates}
     candidate_order = policy.get("candidateOrder", [])
 
-    max_bytes = policy.get("maxBytes", policy.get("maxTotalBytes", float("inf")))
+    max_bytes = policy.get("maxBytes")
+    if max_bytes is None:
+        max_bytes = policy.get("maxTotalBytes")
+    if max_bytes is None:
+        max_bytes = float("inf")
+
     max_latency = policy.get("maxLatencyMs", float("inf"))
+    if max_latency is None:
+        max_latency = float("inf")
 
     for name in candidate_order:
         cand = candidate_map.get(name)
@@ -182,8 +201,8 @@ def quantize():
         return jsonify(res), status_code
 
     elif phase == "select":
-        policy = payload.get("policy", {})
-        err = validate_policy_payload(policy)
+        raw_policy = payload.get("policy", {})
+        err = validate_policy_payload(raw_policy)
         if err:
             return jsonify({"status": "error", "message": err}), 400
 
