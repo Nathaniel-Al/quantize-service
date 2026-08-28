@@ -1,10 +1,19 @@
 import hashlib
+import logging
+import sys
 from typing import Any, Dict, List, Optional, Tuple
 from flask import Flask, jsonify, request
 
+# Configure logging to stdout so logs immediately appear in Render
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(asctime)s] %(levelname)s in %(module)s: %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+logger = logging.getLogger(__name__)
+
 app = Flask(__name__)
 
-# Temporary in-memory state for candidates uploaded during Phase 1
 STORED_CANDIDATES: Dict[str, Dict[str, Any]] = {}
 
 
@@ -13,8 +22,8 @@ def is_finite_number(val: Any) -> bool:
 
 
 def validate_freeze_structure(body: Dict[str, Any]) -> bool:
-    """Validates the schema for Phase 1 (Freeze)."""
     if not isinstance(body, dict):
+        logger.warning("Freeze validation failed: Body is not a JSON object.")
         return False
 
     allowed = body.get("allowedUnsupportedReasons")
@@ -24,92 +33,103 @@ def validate_freeze_structure(body: Dict[str, Any]) -> bool:
             or not all(isinstance(a, str) and a for a in allowed)
             or len(set(allowed)) != len(allowed)
         ):
+            logger.warning("Freeze validation failed: Invalid allowedUnsupportedReasons format.")
             return False
 
     candidates = body.get("candidates")
     if not isinstance(candidates, list) or not candidates:
+        logger.warning("Freeze validation failed: Missing or empty 'candidates' list.")
         return False
 
-    for c in candidates:
+    for idx, c in enumerate(candidates):
         if not isinstance(c, dict):
+            logger.warning(f"Freeze validation failed: Candidate at index {idx} is not an object.")
             return False
         if not isinstance(c.get("name"), str) or not c["name"]:
+            logger.warning(f"Freeze validation failed: Candidate at index {idx} missing valid 'name'.")
             return False
 
         if not c.get("unsupportedReason"):
             if not isinstance(c.get("loadable"), bool):
+                logger.warning(f"Freeze validation failed: Candidate '{c.get('name')}' missing 'loadable' bool.")
                 return False
             if not isinstance(c.get("calibrationDigest"), str):
+                logger.warning(f"Freeze validation failed: Candidate '{c.get('name')}' missing 'calibrationDigest'.")
                 return False
             if not isinstance(c.get("tokenizerDigest"), str):
+                logger.warning(f"Freeze validation failed: Candidate '{c.get('name')}' missing 'tokenizerDigest'.")
                 return False
 
     return True
 
 
 def validate_select_structure(body: Dict[str, Any]) -> bool:
-    """Validates the schema for Phase 2 (Select)."""
     if not isinstance(body, dict):
+        logger.warning("Select validation failed: Body is not a JSON object.")
         return False
 
     candidates = body.get("candidates")
     if candidates is not None and not isinstance(candidates, list):
+        logger.warning("Select validation failed: 'candidates' field is provided but is not a list.")
         return False
 
     if "selectionPolicy" in body and not isinstance(body["selectionPolicy"], dict):
+        logger.warning("Select validation failed: 'selectionPolicy' is not a dict.")
         return False
 
     return True
 
 
 def validate_quantize_structure(body: Dict[str, Any]) -> bool:
-    """Validates the payload structure for Quantize requests."""
     if not isinstance(body, dict):
+        logger.warning("Quantize validation failed: Body is not a dict.")
         return False
 
-    # Check for candidates array OR single candidate/root-level candidate payload
+    # Standard flexible checking for various batch and single candidate formats
     if "candidates" in body:
         candidates = body["candidates"]
-        if not isinstance(candidates, list) or not candidates:
+        if not isinstance(candidates, list):
+            logger.warning("Quantize validation failed: 'candidates' field is not a list.")
             return False
-        for c in candidates:
+        for idx, c in enumerate(candidates):
             if not isinstance(c, dict):
-                return False
-            if not isinstance(c.get("name"), str) or not c["name"]:
+                logger.warning(f"Quantize validation failed: Candidate at index {idx} is not an object.")
                 return False
             if "files" in c and not isinstance(c["files"], list):
+                logger.warning(f"Quantize validation failed: 'files' in candidate '{c.get('name')}' is not a list.")
                 return False
     else:
         target = body.get("candidate", body)
         if not isinstance(target, dict):
-            return False
-        if not isinstance(target.get("name"), str) or not target["name"]:
+            logger.warning("Quantize validation failed: Target payload is not an object.")
             return False
         if "files" in target and not isinstance(target["files"], list):
+            logger.warning("Quantize validation failed: 'files' field is present but not a list.")
             return False
 
     return True
 
 
 def validate_policy(body: Dict[str, Any], candidate_names: List[str]) -> bool:
-    """Validates policy rules against candidates."""
     policy = body.get("selectionPolicy", {})
     if not isinstance(policy, dict):
+        logger.warning("Policy validation failed: 'selectionPolicy' is not a dictionary.")
         return False
 
     max_bytes = policy.get("maxTotalBytes")
     if max_bytes is not None and (not is_finite_number(max_bytes) or max_bytes < 0):
+        logger.warning(f"Policy validation failed: Invalid maxTotalBytes '{max_bytes}'.")
         return False
 
     max_latency = policy.get("maxLatencyMs")
     if max_latency is not None and (not is_finite_number(max_latency) or max_latency < 0):
+        logger.warning(f"Policy validation failed: Invalid maxLatencyMs '{max_latency}'.")
         return False
 
     return True
 
 
 def recompute_manifest(base_candidate: Dict[str, Any], files: List[Dict[str, Any]]) -> Tuple[bool, Optional[int], Optional[str]]:
-    """Calculates package total bytes and digest without assuming declared metadata is correct."""
     total_bytes = 0
     hasher = hashlib.sha256()
 
@@ -124,7 +144,8 @@ def recompute_manifest(base_candidate: Dict[str, Any], files: List[Dict[str, Any
 
         calculated_digest = hasher.hexdigest()
         return True, total_bytes, calculated_digest
-    except Exception:
+    except Exception as e:
+        logger.error(f"Error recomputing manifest: {str(e)}")
         return False, None, None
 
 
@@ -161,10 +182,12 @@ def handle_select(body: Dict[str, Any]) -> Dict[str, Any]:
     max_latency = policy.get("maxLatencyMs", float("inf"))
 
     admitted_results = []
-    order_index = {c["name"]: idx for idx, c in enumerate(submitted_candidates)}
+    order_index = {c["name"]: idx for idx, c in enumerate(submitted_candidates) if "name" in c}
 
     for c in submitted_candidates:
-        name = c["name"]
+        name = c.get("name")
+        if not name:
+            continue
         total_bytes = c.get("totalBytes", 0)
         latency_ms = c.get("latencyMs")
 
@@ -198,7 +221,6 @@ def handle_select(body: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def handle_quantize(body: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], bool]:
-    """Processes quantization requests, recalculates file manifests, and updates state."""
     is_batch = "candidates" in body
     items = body["candidates"] if is_batch else [body.get("candidate", body)]
     processed = []
@@ -209,6 +231,7 @@ def handle_quantize(body: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], boo
 
         ok, total_bytes, package_digest = recompute_manifest(cand, files)
         if not ok:
+            logger.warning(f"Failed manifest recomputation for item: {cand}")
             return None, False
 
         cand["totalBytes"] = total_bytes
@@ -233,7 +256,10 @@ def handle_quantize(body: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], boo
 
 @app.route("/freeze", methods=["POST"])
 def freeze_endpoint():
+    raw_data = request.get_data(as_text=True)
+    logger.info(f"POST /freeze raw body: {raw_data}")
     body = request.get_json(silent=True) or {}
+
     if not validate_freeze_structure(body):
         return jsonify({"error": "INVALID_INPUT"}), 400
 
@@ -243,11 +269,14 @@ def freeze_endpoint():
 
 @app.route("/select", methods=["POST"])
 def select_endpoint():
+    raw_data = request.get_data(as_text=True)
+    logger.info(f"POST /select raw body: {raw_data}")
     body = request.get_json(silent=True) or {}
+
     if not validate_select_structure(body):
         return jsonify({"error": "INVALID_INPUT"}), 400
 
-    candidate_names = [c["name"] for c in body.get("candidates", []) if "name" in c]
+    candidate_names = [c["name"] for c in body.get("candidates", []) if isinstance(c, dict) and "name" in c]
     if not validate_policy(body, candidate_names):
         return jsonify({"error": "INVALID_INPUT"}), 400
 
@@ -257,16 +286,22 @@ def select_endpoint():
 
 @app.route("/quantize", methods=["POST"])
 def quantize_endpoint():
+    raw_data = request.get_data(as_text=True)
+    logger.info(f"POST /quantize raw body: {raw_data}")
     body = request.get_json(silent=True) or {}
+
     if not validate_quantize_structure(body):
+        logger.warning(f"POST /quantize validation rejected payload: {body}")
         return jsonify({"error": "INVALID_INPUT"}), 400
 
     response_data, ok = handle_quantize(body)
     if not ok:
+        logger.warning(f"POST /quantize processing failed for payload: {body}")
         return jsonify({"error": "INVALID_INPUT"}), 400
 
     return jsonify(response_data), 200
 
 
 if __name__ == "__main__":
-    app.run(port=10000)
+    port = int(os.environ.get("PORT", 8000))
+    app.run(host="0.0.0.0", port=port)
