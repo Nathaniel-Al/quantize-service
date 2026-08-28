@@ -17,7 +17,6 @@ def validate_freeze_structure(body: Dict[str, Any]) -> bool:
     if not isinstance(body, dict):
         return False
 
-    # Issue 1 Fix: allowedUnsupportedReasons should be optional
     allowed = body.get("allowedUnsupportedReasons")
     if allowed is not None:
         if (
@@ -37,7 +36,6 @@ def validate_freeze_structure(body: Dict[str, Any]) -> bool:
         if not isinstance(c.get("name"), str) or not c["name"]:
             return False
 
-        # Issue 3 Fix: Skip loadable/digest checks if unsupportedReason is populated
         if not c.get("unsupportedReason"):
             if not isinstance(c.get("loadable"), bool):
                 return False
@@ -54,7 +52,6 @@ def validate_select_structure(body: Dict[str, Any]) -> bool:
     if not isinstance(body, dict):
         return False
 
-    # Issue 2 Fix: candidates list is optional during Select phase
     candidates = body.get("candidates")
     if candidates is not None and not isinstance(candidates, list):
         return False
@@ -65,15 +62,41 @@ def validate_select_structure(body: Dict[str, Any]) -> bool:
     return True
 
 
+def validate_quantize_structure(body: Dict[str, Any]) -> bool:
+    """Validates the payload structure for Quantize requests."""
+    if not isinstance(body, dict):
+        return False
+
+    # Check for candidates array OR single candidate/root-level candidate payload
+    if "candidates" in body:
+        candidates = body["candidates"]
+        if not isinstance(candidates, list) or not candidates:
+            return False
+        for c in candidates:
+            if not isinstance(c, dict):
+                return False
+            if not isinstance(c.get("name"), str) or not c["name"]:
+                return False
+            if "files" in c and not isinstance(c["files"], list):
+                return False
+    else:
+        target = body.get("candidate", body)
+        if not isinstance(target, dict):
+            return False
+        if not isinstance(target.get("name"), str) or not target["name"]:
+            return False
+        if "files" in target and not isinstance(target["files"], list):
+            return False
+
+    return True
+
+
 def validate_policy(body: Dict[str, Any], candidate_names: List[str]) -> bool:
     """Validates policy rules against candidates."""
     policy = body.get("selectionPolicy", {})
     if not isinstance(policy, dict):
         return False
 
-    # Issue 5 Fix: Candidate latencies should not invalidate the entire policy structure.
-    # Policy structure checks (e.g., maxTotalBytes, maxLatencyMs) remain, while individual
-    # latency evaluations are deferred to candidate-level selection checks.
     max_bytes = policy.get("maxTotalBytes")
     if max_bytes is not None and (not is_finite_number(max_bytes) or max_bytes < 0):
         return False
@@ -100,9 +123,6 @@ def recompute_manifest(base_candidate: Dict[str, Any], files: List[Dict[str, Any
             hasher.update(content)
 
         calculated_digest = hasher.hexdigest()
-
-        # Issue 6 Fix: Never fail evaluation based on declared vs computed mismatches;
-        # return computed values directly per design contract.
         return True, total_bytes, calculated_digest
     except Exception:
         return False, None, None
@@ -134,7 +154,6 @@ def compute_freeze_response(body: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def handle_select(body: Dict[str, Any]) -> Dict[str, Any]:
-    # Issue 2 Fix: Safely fall back to stored candidates if omitted in payload
     submitted_candidates = body.get("candidates") or list(STORED_CANDIDATES.values())
     policy = body.get("selectionPolicy", {})
 
@@ -149,7 +168,6 @@ def handle_select(body: Dict[str, Any]) -> Dict[str, Any]:
         total_bytes = c.get("totalBytes", 0)
         latency_ms = c.get("latencyMs")
 
-        # Basic admissibility check
         if total_bytes > max_bytes:
             continue
         if latency_ms is not None and latency_ms > max_latency:
@@ -162,7 +180,6 @@ def handle_select(body: Dict[str, Any]) -> Dict[str, Any]:
             "candidate": c
         })
 
-    # Issue 4 Fix: Safe sort key handling None for latencyMs
     admitted_sorted = sorted(
         admitted_results,
         key=lambda r: (
@@ -178,6 +195,40 @@ def handle_select(body: Dict[str, Any]) -> Dict[str, Any]:
         "selected": selected_candidate["name"] if selected_candidate else None,
         "admittedCount": len(admitted_sorted),
     }
+
+
+def handle_quantize(body: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], bool]:
+    """Processes quantization requests, recalculates file manifests, and updates state."""
+    is_batch = "candidates" in body
+    items = body["candidates"] if is_batch else [body.get("candidate", body)]
+    processed = []
+
+    for item in items:
+        cand = dict(item)
+        files = cand.get("files", body.get("files", []))
+
+        ok, total_bytes, package_digest = recompute_manifest(cand, files)
+        if not ok:
+            return None, False
+
+        cand["totalBytes"] = total_bytes
+        cand["packageDigest"] = package_digest
+
+        name = cand.get("name")
+        if name:
+            if name in STORED_CANDIDATES:
+                STORED_CANDIDATES[name].update(cand)
+            else:
+                STORED_CANDIDATES[name] = cand
+
+        processed.append(cand)
+
+    if is_batch:
+        return {"candidates": processed}, True
+    elif "candidate" in body:
+        return {"candidate": processed[0]}, True
+    else:
+        return processed[0], True
 
 
 @app.route("/freeze", methods=["POST"])
@@ -201,6 +252,19 @@ def select_endpoint():
         return jsonify({"error": "INVALID_INPUT"}), 400
 
     response_data = handle_select(body)
+    return jsonify(response_data), 200
+
+
+@app.route("/quantize", methods=["POST"])
+def quantize_endpoint():
+    body = request.get_json(silent=True) or {}
+    if not validate_quantize_structure(body):
+        return jsonify({"error": "INVALID_INPUT"}), 400
+
+    response_data, ok = handle_quantize(body)
+    if not ok:
+        return jsonify({"error": "INVALID_INPUT"}), 400
+
     return jsonify(response_data), 200
 
 
