@@ -1,10 +1,10 @@
 import hashlib
 import logging
+import os
 import sys
 from typing import Any, Dict, List, Optional, Tuple
 from flask import Flask, jsonify, request
 
-# Configure logging to stdout so logs immediately appear in Render
 logging.basicConfig(
     level=logging.INFO,
     format="[%(asctime)s] %(levelname)s in %(module)s: %(message)s",
@@ -37,8 +37,9 @@ def validate_freeze_structure(body: Dict[str, Any]) -> bool:
             return False
 
     candidates = body.get("candidates")
-    if not isinstance(candidates, list) or not candidates:
-        logger.warning("Freeze validation failed: Missing or empty 'candidates' list.")
+    # Fix: Allow empty list [] for zero-candidate test cases
+    if not isinstance(candidates, list):
+        logger.warning("Freeze validation failed: 'candidates' field missing or not a list.")
         return False
 
     for idx, c in enumerate(candidates):
@@ -85,7 +86,6 @@ def validate_quantize_structure(body: Dict[str, Any]) -> bool:
         logger.warning("Quantize validation failed: Body is not a dict.")
         return False
 
-    # Standard flexible checking for various batch and single candidate formats
     if "candidates" in body:
         candidates = body["candidates"]
         if not isinstance(candidates, list):
@@ -182,9 +182,11 @@ def handle_select(body: Dict[str, Any]) -> Dict[str, Any]:
     max_latency = policy.get("maxLatencyMs", float("inf"))
 
     admitted_results = []
-    order_index = {c["name"]: idx for idx, c in enumerate(submitted_candidates) if "name" in c}
+    order_index = {c["name"]: idx for idx, c in enumerate(submitted_candidates) if isinstance(c, dict) and "name" in c}
 
     for c in submitted_candidates:
+        if not isinstance(c, dict):
+            continue
         name = c.get("name")
         if not name:
             continue
@@ -256,10 +258,7 @@ def handle_quantize(body: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], boo
 
 @app.route("/freeze", methods=["POST"])
 def freeze_endpoint():
-    raw_data = request.get_data(as_text=True)
-    logger.info(f"POST /freeze raw body: {raw_data}")
     body = request.get_json(silent=True) or {}
-
     if not validate_freeze_structure(body):
         return jsonify({"error": "INVALID_INPUT"}), 400
 
@@ -269,10 +268,7 @@ def freeze_endpoint():
 
 @app.route("/select", methods=["POST"])
 def select_endpoint():
-    raw_data = request.get_data(as_text=True)
-    logger.info(f"POST /select raw body: {raw_data}")
     body = request.get_json(silent=True) or {}
-
     if not validate_select_structure(body):
         return jsonify({"error": "INVALID_INPUT"}), 400
 
@@ -290,6 +286,25 @@ def quantize_endpoint():
     logger.info(f"POST /quantize raw body: {raw_data}")
     body = request.get_json(silent=True) or {}
 
+    phase = body.get("phase")
+
+    # Route based on the 'phase' parameter inside the request body
+    if phase == "freeze":
+        if not validate_freeze_structure(body):
+            logger.warning("Freeze phase validation failed inside /quantize endpoint.")
+            return jsonify({"error": "INVALID_INPUT"}), 400
+        return jsonify(compute_freeze_response(body)), 200
+
+    elif phase == "select":
+        if not validate_select_structure(body):
+            logger.warning("Select phase validation failed inside /quantize endpoint.")
+            return jsonify({"error": "INVALID_INPUT"}), 400
+        candidate_names = [c["name"] for c in body.get("candidates", []) if isinstance(c, dict) and "name" in c]
+        if not validate_policy(body, candidate_names):
+            return jsonify({"error": "INVALID_INPUT"}), 400
+        return jsonify(handle_select(body)), 200
+
+    # Default quantization handler
     if not validate_quantize_structure(body):
         logger.warning(f"POST /quantize validation rejected payload: {body}")
         return jsonify({"error": "INVALID_INPUT"}), 400
