@@ -315,9 +315,11 @@ async def quantize(request: Request):
     try:
         body = await request.json()
     except Exception:
+        print(f"Failed validation on payload: {body}")
         return JSONResponse({"error": "INVALID_INPUT"}, status_code=400)
 
     if not isinstance(body, dict):
+        print(f"Failed validation on payload: {body}")
         return JSONResponse({"error": "INVALID_INPUT"}, status_code=400)
 
     phase = body.get("phase")
