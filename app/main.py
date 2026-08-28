@@ -28,21 +28,15 @@ def validate_freeze_structure(body: Dict[str, Any]) -> bool:
 
     allowed = body.get("allowedUnsupportedReasons")
     if allowed is not None:
-        if (
-            not isinstance(allowed, list)
-            or not all(isinstance(a, str) and a for a in allowed)
-            or len(set(allowed)) != len(allowed)
-        ):
+        if not isinstance(allowed, list) or not all(isinstance(a, str) and a for a in allowed):
             logger.warning("Freeze validation failed: Invalid allowedUnsupportedReasons format.")
             return False
 
     candidates = body.get("candidates")
-    # Reject missing, non-list, or empty candidate arrays
     if not isinstance(candidates, list) or not candidates:
         logger.warning("Freeze validation failed: 'candidates' field missing, not a list, or empty.")
         return False
 
-    candidate_names = []
     top_cal = body.get("calibrationDigest")
     top_tok = body.get("tokenizerDigest")
 
@@ -55,7 +49,6 @@ def validate_freeze_structure(body: Dict[str, Any]) -> bool:
         if not isinstance(name, str) or not name:
             logger.warning(f"Freeze validation failed: Candidate at index {idx} missing valid 'name'.")
             return False
-        candidate_names.append(name)
 
         if not c.get("unsupportedReason"):
             if not isinstance(c.get("loadable"), bool):
@@ -72,10 +65,6 @@ def validate_freeze_structure(body: Dict[str, Any]) -> bool:
                 logger.warning(f"Freeze validation failed: Candidate '{name}' missing valid 'tokenizerDigest'.")
                 return False
 
-    if len(set(candidate_names)) != len(candidate_names):
-        logger.warning("Freeze validation failed: Duplicate candidate names found in payload.")
-        return False
-
     return True
 
 
@@ -88,10 +77,6 @@ def validate_select_structure(body: Dict[str, Any]) -> bool:
     if candidates is not None:
         if not isinstance(candidates, list):
             logger.warning("Select validation failed: 'candidates' field is provided but is not a list.")
-            return False
-        names = [c.get("name") for c in candidates if isinstance(c, dict) and isinstance(c.get("name"), str)]
-        if len(names) != len(candidates) or len(set(names)) != len(names):
-            logger.warning("Select validation failed: Duplicate or invalid candidate names.")
             return False
 
     if "selectionPolicy" in body and not isinstance(body["selectionPolicy"], dict):
@@ -111,11 +96,10 @@ def validate_quantize_structure(body: Dict[str, Any]) -> bool:
         if not isinstance(candidates, list):
             logger.warning("Quantize validation failed: 'candidates' field is not a list.")
             return False
-        names = [c.get("name") for c in candidates if isinstance(c, dict) and isinstance(c.get("name"), str)]
-        if len(names) != len(candidates) or len(set(names)) != len(names):
-            logger.warning("Quantize validation failed: Duplicate or invalid candidate names.")
-            return False
         for idx, c in enumerate(candidates):
+            if not isinstance(c, dict):
+                logger.warning(f"Quantize validation failed: Candidate at index {idx} is not an object.")
+                return False
             if "files" in c and not isinstance(c["files"], list):
                 logger.warning(f"Quantize validation failed: 'files' in candidate '{c.get('name')}' is not a list.")
                 return False
