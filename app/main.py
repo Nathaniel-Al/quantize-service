@@ -37,8 +37,9 @@ def validate_freeze_structure(body: Dict[str, Any]) -> bool:
             return False
 
     candidates = body.get("candidates")
-    if not isinstance(candidates, list):
-        logger.warning("Freeze validation failed: 'candidates' field missing or not a list.")
+    # Reject missing, non-list, or empty candidate arrays
+    if not isinstance(candidates, list) or not candidates:
+        logger.warning("Freeze validation failed: 'candidates' field missing, not a list, or empty.")
         return False
 
     candidate_names = []
@@ -71,7 +72,6 @@ def validate_freeze_structure(body: Dict[str, Any]) -> bool:
                 logger.warning(f"Freeze validation failed: Candidate '{name}' missing valid 'tokenizerDigest'.")
                 return False
 
-    # Enforce unique candidate names within the payload
     if len(set(candidate_names)) != len(candidate_names):
         logger.warning("Freeze validation failed: Duplicate candidate names found in payload.")
         return False
