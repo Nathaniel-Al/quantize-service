@@ -6,7 +6,6 @@ app = Flask(__name__)
 logger = logging.getLogger("main")
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s in %(module)s: %(message)s")
 
-# In-memory store for frozen sessions: freezeId -> dict of candidate states
 FREEZE_STORE: Dict[str, Dict[str, Any]] = {}
 
 
@@ -16,21 +15,18 @@ FREEZE_STORE: Dict[str, Dict[str, Any]] = {}
 
 def validate_candidate(cand: Dict[str, Any], top_cal: str, top_tok: str, allowed_reasons: List[str]) -> Dict[str, Any]:
     """Validates an individual candidate and assigns its freeze status."""
-    name = cand.get("name")
     loadable = cand.get("loadable", False)
     cal_digest = cand.get("calibrationDigest")
     tok_digest = cand.get("tokenizerDigest")
     unsupported_reason = cand.get("unsupportedReason")
 
-    # Loadable candidate requirement: digests must match top-level request
     if loadable:
         if cal_digest == top_cal and tok_digest == top_tok:
             return {**cand, "status": "frozen"}
         return {**cand, "status": "invalid", "reason": "DIGEST_MISMATCH"}
 
-    # Non-loadable candidate requirement: unsupportedReason must be explicitly allowed
     if unsupported_reason and unsupported_reason in allowed_reasons:
-        return {**cand, "status": "frozen"}
+        return {**cand, "status": "unsupported"}
 
     return {**cand, "status": "invalid", "reason": "UNALLOWED_REASON_OR_BAD_INPUT"}
 
@@ -40,10 +36,8 @@ def process_freeze(payload: Dict[str, Any]):
     freeze_id = payload.get("freezeId")
     candidates = payload.get("candidates")
 
-    # Strict Validation: Reject missing, non-list, or empty candidate list
     if not isinstance(candidates, list) or len(candidates) == 0:
         logger.warning("Freeze validation failed: 'candidates' field missing, not a list, or empty.")
-        logger.warning("Freeze phase validation failed inside /quantize endpoint.")
         return {"status": "error", "message": "'candidates' field missing, not a list, or empty."}, 400
 
     top_cal = payload.get("calibrationDigest", "")
@@ -55,12 +49,12 @@ def process_freeze(payload: Dict[str, Any]):
         validated = validate_candidate(cand, top_cal, top_tok, allowed_reasons)
         processed_candidates.append(validated)
 
-    # Persist frozen state in memory for subsequent 'select' phase calls
-    FREEZE_STORE[freeze_id] = {
-        "freezeId": freeze_id,
-        "candidates": processed_candidates,
-        "allowedUnsupportedReasons": allowed_reasons,
-    }
+    if freeze_id:
+        FREEZE_STORE[freeze_id] = {
+            "freezeId": freeze_id,
+            "candidates": processed_candidates,
+            "allowedUnsupportedReasons": allowed_reasons,
+        }
 
     return {
         "status": "frozen",
@@ -75,7 +69,7 @@ def process_freeze(payload: Dict[str, Any]):
 
 def sanitize_policy(policy: Dict[str, Any]) -> Dict[str, Any]:
     """Sanitizes policy bounds by resetting negative byte constraints to unbounded (None)."""
-    sanitized = dict(policy)
+    sanitized = dict(policy) if isinstance(policy, dict) else {}
 
     for byte_key in ("maxBytes", "maxTotalBytes"):
         if byte_key in sanitized:
@@ -95,7 +89,7 @@ def validate_policy_payload(policy: Dict[str, Any]) -> Optional[str]:
 
 
 def evaluate_accuracy(candidate_name: str, rows: List[Dict[str, Any]], policy: Dict[str, Any]) -> bool:
-    """Evaluates aggregate and per-slice accuracy thresholds for a candidate."""
+    """Evaluates aggregate and per-slice accuracy thresholds for a candidate safely handling missing keys."""
     if not rows:
         return True
 
@@ -106,9 +100,14 @@ def evaluate_accuracy(candidate_name: str, rows: List[Dict[str, Any]], policy: D
     for row in rows:
         label = row.get("label")
         slice_name = row.get("slice")
-        pred = row.get("predictions", {}).get(candidate_name)
+        predictions = row.get("predictions", {})
 
-        is_correct = (pred == label)
+        # Handle missing prediction entries explicitly
+        if candidate_name not in predictions:
+            is_correct = False
+        else:
+            is_correct = (predictions[candidate_name] == label)
+
         if is_correct:
             total_correct += 1
 
@@ -119,12 +118,10 @@ def evaluate_accuracy(candidate_name: str, rows: List[Dict[str, Any]], policy: D
             if is_correct:
                 slice_counts[slice_name][0] += 1
 
-    # Aggregate accuracy floor check
     aggregate_acc = total_correct / total_rows
     if aggregate_acc < policy.get("aggregateFloor", 0.0):
         return False
 
-    # Per-slice accuracy checks
     required_slices = policy.get("requiredSlices", {})
     for slice_name, min_acc in required_slices.items():
         if slice_name in slice_counts:
@@ -137,15 +134,24 @@ def evaluate_accuracy(candidate_name: str, rows: List[Dict[str, Any]], policy: D
 
 
 def select_candidate(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Evaluates valid candidates in candidateOrder and selects the optimal one."""
+    """Evaluates valid candidates in candidateOrder and selects the optimal candidate."""
     policy = sanitize_policy(payload.get("policy", {}))
     latencies = payload.get("latencies", {})
-    rows = payload.get("rows", [])
+    rows = payload.get("rows") or []
     freeze_id = payload.get("freezeId")
 
-    # Fetch stored candidates from freeze phase, or fallback to request body
-    candidates = FREEZE_STORE.get(freeze_id, {}).get("candidates", payload.get("candidates", []))
-    candidate_map = {c["name"]: c for c in candidates}
+    payload_candidates = payload.get("candidates")
+    stored_candidates = FREEZE_STORE.get(freeze_id, {}).get("candidates")
+
+    # Merge or select candidate source prioritizing request payload when explicit status exists
+    if payload_candidates is not None:
+        candidates = payload_candidates
+    elif stored_candidates is not None:
+        candidates = stored_candidates
+    else:
+        candidates = []
+
+    candidate_map = {c.get("name"): c for c in candidates if isinstance(c, dict) and "name" in c}
     candidate_order = policy.get("candidateOrder", [])
 
     max_bytes = policy.get("maxBytes")
@@ -154,7 +160,7 @@ def select_candidate(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if max_bytes is None:
         max_bytes = float("inf")
 
-    max_latency = policy.get("maxLatencyMs", float("inf"))
+    max_latency = policy.get("maxLatencyMs")
     if max_latency is None:
         max_latency = float("inf")
 
@@ -163,20 +169,21 @@ def select_candidate(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         if not cand:
             continue
 
-        # Rule 1: Candidate status must be 'frozen' (loadable & valid)
+        # Status check: candidate must be explicitly marked frozen
         if cand.get("status") != "frozen":
             continue
 
-        # Rule 2: Byte budget constraint
+        # Byte constraint check
         total_bytes = cand.get("totalBytes")
         if total_bytes is not None and total_bytes > max_bytes:
             continue
 
-        # Rule 3: Latency constraint
-        if latencies.get(name, float("inf")) > max_latency:
+        # Latency constraint check
+        cand_latency = latencies.get(name, float("inf"))
+        if cand_latency > max_latency:
             continue
 
-        # Rule 4: Accuracy constraints
+        # Accuracy constraint check
         if not evaluate_accuracy(name, rows, policy):
             continue
 
@@ -191,7 +198,7 @@ def select_candidate(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
 @app.route("/quantize", methods=["POST"])
 def quantize():
-    payload = request.get_json(force=True) or {}
+    payload = request.get_json(force=True, silent=True) or {}
     logger.info(f"POST /quantize raw body: {request.get_data(as_text=True)}")
 
     phase = payload.get("phase")
