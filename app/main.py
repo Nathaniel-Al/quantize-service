@@ -37,8 +37,9 @@ def validate_freeze_structure(body: Dict[str, Any]) -> bool:
             return False
 
     candidates = body.get("candidates")
-    if not isinstance(candidates, list):
-        logger.warning("Freeze validation failed: 'candidates' field missing or not a list.")
+    # Require candidates to be a non-empty list
+    if not isinstance(candidates, list) or not candidates:
+        logger.warning("Freeze validation failed: 'candidates' field missing, not a list, or empty.")
         return False
 
     top_cal = body.get("calibrationDigest")
@@ -60,10 +61,10 @@ def validate_freeze_structure(body: Dict[str, Any]) -> bool:
             cand_cal = c.get("calibrationDigest", top_cal)
             cand_tok = c.get("tokenizerDigest", top_tok)
 
-            if not isinstance(cand_cal, str):
+            if not isinstance(cand_cal, str) or not cand_cal:
                 logger.warning(f"Freeze validation failed: Candidate '{c.get('name')}' missing valid 'calibrationDigest'.")
                 return False
-            if not isinstance(cand_tok, str):
+            if not isinstance(cand_tok, str) or not cand_tok:
                 logger.warning(f"Freeze validation failed: Candidate '{c.get('name')}' missing valid 'tokenizerDigest'.")
                 return False
 
@@ -76,9 +77,10 @@ def validate_select_structure(body: Dict[str, Any]) -> bool:
         return False
 
     candidates = body.get("candidates")
-    if candidates is not None and not isinstance(candidates, list):
-        logger.warning("Select validation failed: 'candidates' field is provided but is not a list.")
-        return False
+    if candidates is not None:
+        if not isinstance(candidates, list) or not candidates:
+            logger.warning("Select validation failed: 'candidates' field is provided but is empty or not a list.")
+            return False
 
     if "selectionPolicy" in body and not isinstance(body["selectionPolicy"], dict):
         logger.warning("Select validation failed: 'selectionPolicy' is not a dict.")
@@ -94,8 +96,8 @@ def validate_quantize_structure(body: Dict[str, Any]) -> bool:
 
     if "candidates" in body:
         candidates = body["candidates"]
-        if not isinstance(candidates, list):
-            logger.warning("Quantize validation failed: 'candidates' field is not a list.")
+        if not isinstance(candidates, list) or not candidates:
+            logger.warning("Quantize validation failed: 'candidates' field is empty or not a list.")
             return False
         for idx, c in enumerate(candidates):
             if not isinstance(c, dict):
@@ -188,7 +190,6 @@ def compute_freeze_response(body: Dict[str, Any]) -> Dict[str, Any]:
 
     response: Dict[str, Any] = {"candidates": results}
 
-    # Preserve all top-level context fields in response payload
     for field in ["freezeId", "phase", "calibrationDigest", "tokenizerDigest", "allowedUnsupportedReasons"]:
         if field in body:
             response[field] = body[field]
