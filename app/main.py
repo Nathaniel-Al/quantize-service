@@ -539,3 +539,6 @@ def healthz():
 
 if __name__ == "__main__":
     import os
+    port = int(os.environ.get("PORT", 8000))
+    # Only run the Flask development server when executing the module directly.
+    app.run(host="0.0.0.0", port=port)
