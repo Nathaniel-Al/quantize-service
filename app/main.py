@@ -74,13 +74,13 @@ def validate_select_structure(body: Dict[str, Any]) -> bool:
         return False
 
     candidates = body.get("candidates")
-    if candidates is not None:
-        if not isinstance(candidates, list):
-            logger.warning("Select validation failed: 'candidates' field is provided but is not a list.")
-            return False
+    if candidates is not None and not isinstance(candidates, list):
+        logger.warning("Select validation failed: 'candidates' field is provided but is not a list.")
+        return False
 
-    if "selectionPolicy" in body and not isinstance(body["selectionPolicy"], dict):
-        logger.warning("Select validation failed: 'selectionPolicy' is not a dict.")
+    policy = body.get("policy") or body.get("selectionPolicy")
+    if policy is not None and not isinstance(policy, dict):
+        logger.warning("Select validation failed: Policy field is present but not a dictionary.")
         return False
 
     return True
@@ -116,14 +116,14 @@ def validate_quantize_structure(body: Dict[str, Any]) -> bool:
 
 
 def validate_policy(body: Dict[str, Any], candidate_names: List[str]) -> bool:
-    policy = body.get("selectionPolicy", {})
+    policy = body.get("policy") or body.get("selectionPolicy") or {}
     if not isinstance(policy, dict):
-        logger.warning("Policy validation failed: 'selectionPolicy' is not a dictionary.")
+        logger.warning("Policy validation failed: policy is not a dictionary.")
         return False
 
-    max_bytes = policy.get("maxTotalBytes")
+    max_bytes = policy.get("maxBytes") if "maxBytes" in policy else policy.get("maxTotalBytes")
     if max_bytes is not None and (not is_finite_number(max_bytes) or max_bytes < 0):
-        logger.warning(f"Policy validation failed: Invalid maxTotalBytes '{max_bytes}'.")
+        logger.warning(f"Policy validation failed: Invalid maxBytes/maxTotalBytes '{max_bytes}'.")
         return False
 
     max_latency = policy.get("maxLatencyMs")
@@ -215,29 +215,54 @@ def compute_freeze_response(body: Dict[str, Any]) -> Dict[str, Any]:
 
 def handle_select(body: Dict[str, Any]) -> Dict[str, Any]:
     submitted_candidates = body.get("candidates") or list(STORED_CANDIDATES.values())
-    policy = body.get("selectionPolicy", {})
+    policy = body.get("policy") or body.get("selectionPolicy") or {}
+    latencies_map = body.get("latencies", {})
 
-    max_bytes = policy.get("maxTotalBytes", float("inf"))
-    max_latency = policy.get("maxLatencyMs", float("inf"))
+    max_bytes = policy.get("maxBytes")
+    if max_bytes is None:
+        max_bytes = policy.get("maxTotalBytes")
+
+    max_latency = policy.get("maxLatencyMs")
+
+    if max_bytes is None or not is_finite_number(max_bytes):
+        max_bytes = float("inf")
+    if max_latency is None or not is_finite_number(max_latency):
+        max_latency = float("inf")
+
+    candidate_order = policy.get("candidateOrder", [])
+    order_index = {}
+    if isinstance(candidate_order, list) and candidate_order:
+        for idx, name in enumerate(candidate_order):
+            if isinstance(name, str):
+                order_index[name] = idx
+    else:
+        for idx, c in enumerate(submitted_candidates):
+            if isinstance(c, dict) and isinstance(c.get("name"), str):
+                order_index[c["name"]] = idx
 
     admitted_results = []
-    order_index = {}
-    for idx, c in enumerate(submitted_candidates):
-        if isinstance(c, dict) and isinstance(c.get("name"), str):
-            order_index[c["name"]] = idx
-
     for c in submitted_candidates:
         if not isinstance(c, dict):
             continue
         name = c.get("name")
         if not isinstance(name, str):
             continue
-        total_bytes = c.get("totalBytes", 0)
-        latency_ms = c.get("latencyMs")
 
-        if total_bytes > max_bytes:
+        status = c.get("status")
+        if status and status.lower() not in ["frozen", "ok", "valid"]:
             continue
-        if latency_ms is not None and latency_ms > max_latency:
+
+        total_bytes = c.get("totalBytes")
+        if total_bytes is None or not is_finite_number(total_bytes) or total_bytes > max_bytes:
+            continue
+
+        latency_ms = c.get("latencyMs")
+        if latency_ms is None:
+            latency_ms = c.get("latency")
+        if latency_ms is None and isinstance(latencies_map, dict):
+            latency_ms = latencies_map.get(name)
+
+        if latency_ms is not None and is_finite_number(latency_ms) and latency_ms > max_latency:
             continue
 
         admitted_results.append({
@@ -251,7 +276,7 @@ def handle_select(body: Dict[str, Any]) -> Dict[str, Any]:
         admitted_results,
         key=lambda r: (
             r["totalBytes"],
-            r["latencyMs"] if r["latencyMs"] is not None else float("inf"),
+            r["latencyMs"] if r["latencyMs"] is not None and is_finite_number(r["latencyMs"]) else float("inf"),
             order_index.get(r["name"], len(order_index)),
         ),
     )
@@ -263,7 +288,7 @@ def handle_select(body: Dict[str, Any]) -> Dict[str, Any]:
         "admittedCount": len(admitted_sorted),
     }
 
-    for field in ["selectId", "phase", "selectionPolicy"]:
+    for field in ["selectId", "phase", "selectionPolicy", "policy"]:
         if field in body:
             response[field] = body[field]
 
