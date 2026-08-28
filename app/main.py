@@ -188,11 +188,10 @@ def compute_freeze_response(body: Dict[str, Any]) -> Dict[str, Any]:
 
     response: Dict[str, Any] = {"candidates": results}
 
-    # Echo back metadata identifiers if present
-    if "freezeId" in body:
-        response["freezeId"] = body["freezeId"]
-    if "phase" in body:
-        response["phase"] = body["phase"]
+    # Preserve all top-level context fields in response payload
+    for field in ["freezeId", "phase", "calibrationDigest", "tokenizerDigest", "allowedUnsupportedReasons"]:
+        if field in body:
+            response[field] = body[field]
 
     return response
 
@@ -244,10 +243,9 @@ def handle_select(body: Dict[str, Any]) -> Dict[str, Any]:
         "admittedCount": len(admitted_sorted),
     }
 
-    if "selectId" in body:
-        response["selectId"] = body["selectId"]
-    if "phase" in body:
-        response["phase"] = body["phase"]
+    for field in ["selectId", "phase", "selectionPolicy"]:
+        if field in body:
+            response[field] = body[field]
 
     return response
 
