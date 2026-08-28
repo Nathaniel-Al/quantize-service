@@ -40,20 +40,18 @@ def evaluate_select_candidate(
     name = candidate.get("name")
     status = candidate.get("status")
 
-    # 1. Candidate must be frozen and valid
     if status != "frozen":
         return False
 
-    # 2. Check latency constraint (cand_latency <= maxLatencyMs)
+    # 1. Latency constraint check
     max_latency = policy.get("maxLatencyMs")
     if max_latency is not None:
         cand_latency = latencies.get(name)
         if cand_latency is None or cand_latency > max_latency:
             return False
 
-    # 3. Check memory / byte limit constraint (totalBytes <= maxBytes)
+    # 2. Byte limit constraint check (sanitize non-positive limits)
     max_bytes = policy.get("maxBytes")
-    # Sanitize negative or zero maxBytes to unbounded (None)
     if max_bytes is not None and max_bytes <= 0:
         max_bytes = None
 
@@ -62,16 +60,14 @@ def evaluate_select_candidate(
         if total_bytes is None or total_bytes > max_bytes:
             return False
 
-    # 4. Check accuracy constraints
+    # 3. Accuracy floor checks
     slice_accs = compute_slice_accuracies(rows, name)
 
-    # 4a. Check required accuracy floor per slice
     required_slices = policy.get("requiredSlices", {})
     for slice_name, floor in required_slices.items():
         if slice_accs.get(slice_name, 0.0) < floor:
             return False
 
-    # 4b. Check overall aggregate accuracy floor
     aggregate_floor = policy.get("aggregateFloor")
     if aggregate_floor is not None:
         if not rows:
@@ -91,6 +87,7 @@ def evaluate_select_candidate(
 def quantize():
     payload = request.get_json(silent=True)
     if not isinstance(payload, dict):
+        app.logger.warning("Invalid JSON payload received.")
         return jsonify({
             "selected": None,
             "status": "validation_error",
@@ -104,8 +101,12 @@ def quantize():
     # -------------------------------------------------------------------------
     if phase == "freeze":
         candidates = payload.get("candidates")
+
         if not isinstance(candidates, list) or len(candidates) == 0:
-            app.logger.warning("Freeze validation failed: 'candidates' field missing, not a list, or empty.")
+            app.logger.warning(
+                f"Freeze failed for freezeId='{payload.get('freezeId')}': "
+                f"'candidates' is missing or empty."
+            )
             return jsonify({
                 "selected": None,
                 "status": "validation_error",
@@ -113,6 +114,7 @@ def quantize():
             }), 400
 
         freeze_id = payload.get("freezeId")
+        app.logger.info(f"Freeze successful: freezeId='{freeze_id}', count={len(candidates)}")
         return jsonify({
             "freezeId": freeze_id,
             "status": "frozen",
@@ -125,6 +127,7 @@ def quantize():
     elif phase == "select":
         candidates = payload.get("candidates")
         if not isinstance(candidates, list):
+            app.logger.warning("Select phase failed: 'candidates' must be a list.")
             return jsonify({
                 "selected": None,
                 "status": "validation_error",
@@ -135,24 +138,30 @@ def quantize():
         latencies = payload.get("latencies", {})
         rows = payload.get("rows", [])
 
-        # Respect candidate evaluation order if explicitly specified
+        # Respect candidate order if explicitly specified by policy
         candidate_order = policy.get("candidateOrder", [])
-        cand_map = {c.get("name"): c for c in candidates if isinstance(c, dict) and c.get("name")}
+        cand_map = {
+            c.get("name"): c
+            for c in candidates
+            if isinstance(c, dict) and c.get("name")
+        }
 
         if candidate_order:
             ordered_candidates = [cand_map[name] for name in candidate_order if name in cand_map]
         else:
             ordered_candidates = [c for c in candidates if isinstance(c, dict)]
 
-        # Evaluate candidates in order and select the first matching policy
+        # Evaluate candidate constraints sequentially
         for cand in ordered_candidates:
             if evaluate_select_candidate(cand, policy, latencies, rows):
+                selected_name = cand.get("name")
+                app.logger.info(f"Selected candidate: '{selected_name}'")
                 return jsonify({
-                    "selected": cand.get("name"),
+                    "selected": selected_name,
                     "status": "selected"
                 }), 200
 
-        # Return status when no candidates meet all policy criteria
+        app.logger.info("No candidates satisfied all policy constraints.")
         return jsonify({
             "selected": None,
             "status": "no_candidate_selected"
@@ -161,6 +170,7 @@ def quantize():
     # -------------------------------------------------------------------------
     # UNKNOWN OR MISSING PHASE
     # -------------------------------------------------------------------------
+    app.logger.warning(f"Unrecognized or missing phase: '{phase}'")
     return jsonify({
         "selected": None,
         "status": "validation_error",
